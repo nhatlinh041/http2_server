@@ -1,8 +1,13 @@
 #include "session.h"
 
 Session::Session(boost::asio::ip::tcp::socket p_socket, RequestCB p_request_cb)
-    : socket_(std::move(p_socket)), request_cb_(std::move(p_request_cb)) {
+    : request_cb_(std::move(p_request_cb)), use_ssl_(false) {
+    plain_socket_ = std::make_unique<boost::asio::ip::tcp::socket>(std::move(p_socket));
+}
 
+Session::Session(boost::asio::ip::tcp::socket p_socket, boost::asio::ssl::context& ssl_context, RequestCB p_request_cb)
+    : request_cb_(std::move(p_request_cb)), use_ssl_(true) {
+    ssl_socket_ = std::make_unique<boost::asio::ssl::stream<boost::asio::ip::tcp::socket>>(std::move(p_socket), ssl_context);
 }
 
 Session::~Session() {
@@ -13,8 +18,26 @@ Session::~Session() {
 
 void Session::start() {
     LOG_DEBUG("Start nghttp2 session");
-    setup_nghttp2();
-    read_data();
+    if (use_ssl_) {
+        handle_ssl_handshake();
+    } else {
+        setup_nghttp2();
+        read_data();
+    }
+}
+
+void Session::handle_ssl_handshake() {
+    auto self(shared_from_this());
+    ssl_socket_->async_handshake(boost::asio::ssl::stream_base::server,
+        [this, self](boost::system::error_code ec) {
+            if (!ec) {
+                LOG_DEBUG("SSL handshake completed");
+                setup_nghttp2();
+                read_data();
+            } else {
+                LOG_ERROR("SSL handshake failed: " << ec.message());
+            }
+        });
 }
 
 void Session::setup_nghttp2() {
@@ -39,20 +62,34 @@ void Session::setup_nghttp2() {
 
 void Session::read_data() {
     auto self(shared_from_this());
-    socket_.async_read_some(boost::asio::buffer(read_buffer_),
-        [this, self](boost::system::error_code ec, std::size_t length) {
-            if (!ec) {
-                ssize_t read = nghttp2_session_mem_recv(session_, read_buffer_.data(), length);
-                if (read < 0) {
-                    LOG_ERROR("nghttp2_session_mem_recv error: " << nghttp2_strerror((int)read));
-                    return;
+    
+    if (use_ssl_) {
+        ssl_socket_->async_read_some(boost::asio::buffer(read_buffer_),
+            [this, self](boost::system::error_code ec, std::size_t length) {
+                if (!ec) {
+                    ssize_t read = nghttp2_session_mem_recv(session_, read_buffer_.data(), length);
+                    if (read < 0) {
+                        LOG_ERROR("nghttp2_session_mem_recv error: " << nghttp2_strerror((int)read));
+                        return;
+                    }
+                    write_data();
+                    read_data();
                 }
-                write_data();
-                read_data();
-            } else {
-                LOG_ERROR("Read error: " << ec.message());
-            }
-        });
+            });
+    } else {
+        plain_socket_->async_read_some(boost::asio::buffer(read_buffer_),
+            [this, self](boost::system::error_code ec, std::size_t length) {
+                if (!ec) {
+                    ssize_t read = nghttp2_session_mem_recv(session_, read_buffer_.data(), length);
+                    if (read < 0) {
+                        LOG_ERROR("nghttp2_session_mem_recv error: " << nghttp2_strerror((int)read));
+                        return;
+                    }
+                    write_data();
+                    read_data();
+                }
+            });
+    }
 }
 
 void Session::write_data() {
@@ -147,7 +184,31 @@ int Session::on_data_chunk_recv_cb(nghttp2_session* session, uint8_t flags,
                                     int32_t stream_id, const uint8_t* data,
                                     size_t len, void* user_data) {
     Session* sess = static_cast<Session*>(user_data);
+    LOG_DEBUG("on_data_chunk_recv_cb called: stream=" << stream_id << ", len=" << len << ", flags=" << static_cast<int>(flags));
+    
     sess->streams_data_[stream_id].body.append((const char*)data, len);
+    
+    LOG_DEBUG("Received " << len << " bytes of data on stream " << stream_id << ", flags: " << static_cast<int>(flags) << " (END_STREAM=" << (flags & NGHTTP2_FLAG_END_STREAM ? "YES" : "NO") << ")");
+    LOG_DEBUG("Total body so far: " << sess->streams_data_[stream_id].body.length() << " bytes");
+    
+    // Check if this is the end of the stream
+    if (flags & NGHTTP2_FLAG_END_STREAM) {
+        auto it = sess->streams_data_.find(stream_id);
+        if(it != sess->streams_data_.end()) {
+            // Process the request
+            auto& stream_data = it->second;
+            LOG_INFO("Processing complete request with body " << stream_data.method << " " << stream_data.path << " (body: " << stream_data.body.length() << " bytes)");
+
+            // Create sender function that captures the session and sends the response
+            auto sender = [sess](int32_t stream_id, const HttpResponse& response) {
+                sess->send_response(stream_id, response);
+                sess->write_data();
+            };
+            // Call the request callback with the sender
+            sess->request_cb_(stream_data.method, stream_data.path, stream_data.body, stream_id, sender);
+        }
+    }
+    
     return 0;
 }
 int Session::on_stream_close_cb(nghttp2_session* session, int32_t stream_id,
@@ -163,9 +224,16 @@ ssize_t Session::send_cb(nghttp2_session* session, const uint8_t* data,
     Session* sess = static_cast<Session*>(user_data);
     boost::system::error_code ec;
     
-    size_t written = boost::asio::write(sess->socket_, 
-                                       boost::asio::buffer(data, length), 
-                                       ec);
+    size_t written;
+    if (sess->use_ssl_) {
+        written = boost::asio::write(*sess->ssl_socket_, 
+                                   boost::asio::buffer(data, length), 
+                                   ec);
+    } else {
+        written = boost::asio::write(*sess->plain_socket_, 
+                                   boost::asio::buffer(data, length), 
+                                   ec);
+    }
     
     if (ec) {
         LOG_ERROR("Write error: " << ec.message());

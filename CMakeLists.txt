@@ -28,8 +28,15 @@ if(NOT NGHTTP2_FOUND)
     message(FATAL_ERROR "libnghttp2 not found. Install with: apt-get install libnghttp2-dev")
 endif()
 
+# Find OpenSSL
+find_package(OpenSSL REQUIRED)
+if(NOT OPENSSL_FOUND)
+    message(FATAL_ERROR "OpenSSL not found. Install with: apt-get install libssl-dev")
+endif()
+
 message(STATUS "Found Boost version: ${Boost_VERSION}")
 message(STATUS "Found nghttp2 version: ${NGHTTP2_VERSION}")
+message(STATUS "Found OpenSSL version: ${OPENSSL_VERSION}")
 
 # Include directories
 include_directories(${CMAKE_SOURCE_DIR}/src)
@@ -60,13 +67,36 @@ set(SOURCES
     src/core/server.cpp
     src/transport/session.cpp
     src/transport/request_handler.cpp
+    src/transport/proxy_handler.cpp
+    src/transport/http_client.cpp
+    src/transport/http1_proxy.cpp
+    src/transport/active_request.cpp
 )
 
 # Create executable
 add_executable(${PROJECT_NAME} ${SOURCES})
 
+
+# Create forwarding client
+add_executable(forwarding_client
+    src/examples/forwarding_main.cpp
+    src/examples/forwarding_client.cpp
+    src/transport/proxy_handler.cpp
+    src/transport/http_client.cpp
+    src/transport/http2_client.cpp
+)
+
 # Link libraries
 target_link_libraries(${PROJECT_NAME} PRIVATE
+    Boost::system
+    ${NGHTTP2_LIBRARIES}
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    nlohmann_json::nlohmann_json
+)
+
+
+target_link_libraries(forwarding_client PRIVATE
     Boost::system
     ${NGHTTP2_LIBRARIES}
     nlohmann_json::nlohmann_json
@@ -74,6 +104,13 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 
 # Include directories
 target_include_directories(${PROJECT_NAME} PRIVATE 
+    ${Boost_INCLUDE_DIRS}
+    ${NGHTTP2_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+
+target_include_directories(forwarding_client PRIVATE
     ${Boost_INCLUDE_DIRS}
     ${NGHTTP2_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/src

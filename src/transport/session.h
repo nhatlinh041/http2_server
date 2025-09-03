@@ -4,6 +4,7 @@
 #include "../utils/logger.h"
 
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <nghttp2/nghttp2.h>
 #include <functional>
 
@@ -12,10 +13,10 @@
 class Session : public std::enable_shared_from_this<Session> {
     public:
         explicit Session(boost::asio::ip::tcp::socket p_socket, RequestCB p_request_cb);
+        explicit Session(boost::asio::ip::tcp::socket p_socket, boost::asio::ssl::context& ssl_context, RequestCB p_request_cb);
         ~Session();
 
         void start();
-        boost::asio::ip::tcp::socket& socket() { return socket_; }
     private:
         // nghttp2 callbacks
         static int on_frame_recv_cb(nghttp2_session* session, const nghttp2_frame* frame,
@@ -36,6 +37,7 @@ class Session : public std::enable_shared_from_this<Session> {
         void read_data();
         void write_data();
         void send_response(int32_t p_stream_id, const HttpResponse& p_response);
+        void handle_ssl_handshake();
 
         // Request handling
         struct StreamData
@@ -46,9 +48,11 @@ class Session : public std::enable_shared_from_this<Session> {
         };
         
     private:
-        nghttp2_session* session_;
-        boost::asio::ip::tcp::socket socket_;
+        nghttp2_session* session_ = nullptr;
+        std::unique_ptr<boost::asio::ip::tcp::socket> plain_socket_;
+        std::unique_ptr<boost::asio::ssl::stream<boost::asio::ip::tcp::socket>> ssl_socket_;
         RequestCB request_cb_;
         std::array<uint8_t, 8192> read_buffer_;
         std::unordered_map<int32_t, StreamData> streams_data_;
+        bool use_ssl_ = false;
 };
